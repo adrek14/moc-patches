@@ -9,326 +9,240 @@ For more details, see http://moc.daper.net/node/885
 Signed-off-by: adrek14 <xxxxxxxxxx@xxxxx.xxx>
 
 ---
- common.c                        |   36 +++++++++++++++
- common.h                        |    1 +
- decoder_plugins/aac/aac.c       |   20 +++++++-
- decoder_plugins/flac/flac.c     |   16 ++++---
- decoder_plugins/mp3/mp3.c       |   20 +++++++-
- decoder_plugins/vorbis/vorbis.c |   14 ++++--
- interface.c                     |   13 +++++-
- interface_elements.c            |   20 ++++++++
- menu.c                          |   96 +++++++++++++++++++++++++++++++++------
+ decoder_plugins/aac/aac.c       |   25 +++++++++++
+ decoder_plugins/flac/flac.c     |   30 +++++++++++++
+ decoder_plugins/mp3/mp3.c       |   25 +++++++++++
+ decoder_plugins/vorbis/vorbis.c |   35 +++++++++++++++
+ interface_elements.c            |   38 ++++++++++++++++
+ menu.c                          |   89 ++++++++++++++++++++++++++++++++------
  menu.h                          |    5 ++
  options.c                       |    1 +
  playlist.c                      |    3 +
- playlist.h                      |    4 +-
+ playlist.h                      |    1 +
  playlist_file.c                 |    1 +
- protocol.c                      |    8 +++
- server.c                        |    2 +-
- tags_cache.c                    |   10 ++++-
- 17 files changed, 237 insertions(+), 33 deletions(-)
+ protocol.c                      |    8 ++++
+ tags_cache.c                    |    9 +++-
+ utf8.c                          |   24 ++++++++++-
+ utf8.h                          |    2 +
+ 15 files changed, 279 insertions(+), 17 deletions(-)
 
-diff --git a/common.c b/common.c
-index 69847e7..bb002ae 100644
---- a/common.c
-+++ b/common.c
-@@ -266,3 +266,39 @@ const char *get_home ()
- 
- 	return home;
- }
-+
-+/* Convert rating to text format. Rating must be scaled to 0-255. */
-+void rating_to_str (char *buff, const int rating)
-+{
-+	assert (rating >= 0 && rating <= 255);
-+
-+	const char empty_star[] = " ";
-+	const char filled_star[] = { 0xe2, 0x98, 0x85, '\0' }; // unicode 0x2606
-+	const char * stars[5];
-+	int star_num = 0;
-+	int space_num = 0;
-+	
-+	// Intervals taken from Banshee (said to provide good compatibility).
-+	if (rating == 0)
-+		star_num = 0;
-+	else if (rating <= 63)
-+		star_num = 1;
-+	else if (rating <= 127)
-+		star_num = 2;
-+	else if (rating <= 191)
-+		star_num = 3;
-+	else if (rating <= 254)
-+		star_num = 4;
-+	else
-+		star_num = 5;
-+	space_num = 5 - star_num;
-+	
-+	int i = 0;
-+	while (star_num--)
-+		stars[i++] = filled_star;
-+	while (space_num--)
-+		stars[i++] = empty_star;
-+
-+	snprintf(buff, 16, "%s%s%s%s%s", stars[0], stars[1], stars[2],
-+			stars[3], stars[4]);
-+}
-diff --git a/common.h b/common.h
-index 3913922..dfcd150 100644
---- a/common.h
-+++ b/common.h
-@@ -118,6 +118,7 @@ bool is_valid_symbol (const char *candidate);
- char *create_file_name (const char *file);
- void sec_to_min (char *buff, const int seconds);
- const char *get_home ();
-+void rating_to_str (char *buff, const int rating);
- 
- #ifdef __cplusplus
- }
 diff --git a/decoder_plugins/aac/aac.c b/decoder_plugins/aac/aac.c
-index e93bb22..48a7dc0 100644
+index e93bb22..6f09fcd 100644
 --- a/decoder_plugins/aac/aac.c
 +++ b/decoder_plugins/aac/aac.c
-@@ -373,12 +373,24 @@ static char *get_tag (struct id3_tag *tag, const char *what)
+@@ -62,6 +62,8 @@ struct aac_data
+ 	int duration;
+ };
+ 
++static int tag_rating_scale[] = { 0, 63, 127, 191, 254, 255 };
++
+ static int buffer_length (const struct aac_data *data)
+ {
+ 	return data->rbuf_len - data->rbuf_pos;
+@@ -373,6 +375,28 @@ static char *get_tag (struct id3_tag *tag, const char *what)
  	return comm;
  }
  
-+int get_tag_rating (struct id3_tag *tag)
++static int get_tag_rating (struct id3_tag *tag)
 +{
 +	struct id3_frame *frame;
-+	union id3_field *field;
++	int raw_rating;
++	int rating;
 +
 +	frame = id3_tag_findframe (tag, "POPM", 0);
 +	if (frame && frame->nfields >= 2)
-+		return (int)id3_field_getint(&frame->fields[1]);
++		raw_rating = (int)id3_field_getint(&frame->fields[1]);
 +	else
-+		return 0;
++		return -1;
++
++	if (raw_rating < 0 || raw_rating > 255)
++		return -1;
++
++	for (rating = 0; rating <= 5; ++rating)
++		if (raw_rating <= tag_rating_scale[rating])
++			return rating;
++
++	return -1;
 +}
 +
  /* Fill info structure with data from aac comments */
  static void aac_info (const char *file_name,
  		struct file_tags *info,
- 		const int tags_sel)
- {
--	if (tags_sel & TAGS_COMMENTS) {
-+	if ((tags_sel & TAGS_COMMENTS) || (tags_sel & TAGS_RATING)) {
- 		struct id3_tag *tag;
- 		struct id3_file *id3file;
- 		char *track = NULL;
-@@ -387,7 +399,8 @@ static void aac_info (const char *file_name,
- 		if (!id3file)
- 			return;
- 		tag = id3_file_tag (id3file);
--		if (tag) {
-+
-+		if (tag && (tags_sel & TAGS_COMMENTS)) {
+@@ -391,6 +415,7 @@ static void aac_info (const char *file_name,
  			info->artist = get_tag (tag, ID3_FRAME_ARTIST);
  			info->title = get_tag (tag, ID3_FRAME_TITLE);
  			info->album = get_tag (tag, ID3_FRAME_ALBUM);
-@@ -402,6 +415,9 @@ static void aac_info (const char *file_name,
- 				free (track);
- 			}
- 		}
-+		if (tag && (tags_sel & TAGS_RATING))
 +			info->rating = get_tag_rating (tag);
-+
- 		id3_file_close (id3file);
- 	}
+ 			track = get_tag (tag, ID3_FRAME_TRACK);
  
+ 			if (track) {
 diff --git a/decoder_plugins/flac/flac.c b/decoder_plugins/flac/flac.c
-index 080add0..729f34c 100644
+index 080add0..4f442c8 100644
 --- a/decoder_plugins/flac/flac.c
 +++ b/decoder_plugins/flac/flac.c
-@@ -423,7 +423,7 @@ static void flac_close (void *void_data)
+@@ -70,6 +70,9 @@ struct flac_data
+ 	struct decoder_error error;
+ };
+ 
++/* First value should be checked for equality. */
++static double comment_rating_scale[] = { 0.5, 0.2, 0.4, 0.6, 0.8, 1.0 };
++
+ /* Convert FLAC big-endian data into PCM little-endian. */
+ static size_t pack_pcm_signed (FLAC__byte *data,
+ 		const FLAC__int32 * const input[], unsigned wide_samples,
+@@ -422,6 +425,29 @@ static void flac_close (void *void_data)
+ 	free (data);
  }
  
++static int get_comment_rating (const char *rating_value)
++{
++	char *rating_value_end;
++	double raw_rating;
++	int rating;
++
++	raw_rating = strtod (rating_value, &rating_value_end);
++	if (*rating_value_end != 0)
++		return -1;
++
++	if (raw_rating < 0.0 || raw_rating > 1.0)
++		return -1;
++
++	if (raw_rating == comment_rating_scale[0])
++		return 0;
++
++	for (rating = 1; rating <= 5; ++rating)
++		if (raw_rating <= comment_rating_scale[rating])
++			return rating;
++
++	return -1;
++}
++
  static void fill_tag (FLAC__StreamMetadata_VorbisComment_Entry *comm,
--		struct file_tags *tags)
-+		struct file_tags *tags, const bool get_rating)
+ 		struct file_tags *tags)
  {
- 	char *name, *value;
- 	FLAC__byte *eq;
-@@ -457,14 +457,18 @@ static void fill_tag (FLAC__StreamMetadata_VorbisComment_Entry *comm,
- 			|| !strcasecmp(name, "track")) {
+@@ -458,6 +484,10 @@ static void fill_tag (FLAC__StreamMetadata_VorbisComment_Entry *comm,
  		tags->track = atoi (value);
  		free (value);
--	}
--	else
-+	} else if (get_rating && !strncasecmp(name, "rating:",
-+			strlen("rating:"))) {
-+		tags->rating = (int)(255 * atof(value));
+ 	}
++	else if (!strncasecmp(name, "rating:", strlen("rating:"))) {
++		tags->rating = get_comment_rating (value);
 +		free (value);
-+	} else
++	}
+ 	else
  		free (value);
  
- 	free (name);
- }
- 
--static void get_vorbiscomments (const char *filename, struct file_tags *tags)
-+static void get_vorbiscomments (const char *filename, struct file_tags *tags,
-+		const bool get_rating)
- {
- 	FLAC__Metadata_SimpleIterator *iterator
- 		= FLAC__metadata_simple_iterator_new();
-@@ -497,7 +501,7 @@ static void get_vorbiscomments (const char *filename, struct file_tags *tags)
- 					= &block->data.vorbis_comment;
- 
- 				for (i = 0; i < vc->num_comments; i++)
--					fill_tag (&vc->comments[i], tags);
-+					fill_tag (&vc->comments[i], tags, get_rating);
- 
- 				FLAC__metadata_object_delete (block);
- 				got_vorbis_comments = true;
-@@ -522,7 +526,7 @@ static void flac_info (const char *file_name, struct file_tags *info,
- 	}
- 
- 	if (tags_sel & TAGS_COMMENTS)
--		get_vorbiscomments (file_name, info);
-+		get_vorbiscomments (file_name, info, tags_sel & TAGS_RATING);
- }
- 
- static int flac_seek (void *void_data, int sec)
 diff --git a/decoder_plugins/mp3/mp3.c b/decoder_plugins/mp3/mp3.c
-index 094f40b..27d61aa 100644
+index 094f40b..ba20972 100644
 --- a/decoder_plugins/mp3/mp3.c
 +++ b/decoder_plugins/mp3/mp3.c
-@@ -184,6 +184,18 @@ static char *get_tag (struct id3_tag *tag, const char *what)
+@@ -75,6 +75,8 @@ struct mp3_data
+ 	struct decoder_error error;
+ };
+ 
++static int tag_rating_scale[] = { 0, 63, 127, 191, 254, 255 };
++
+ /* Fill in the mad buffer, return number of bytes read, 0 on eof or error */
+ static size_t fill_buff (struct mp3_data *data)
+ {
+@@ -184,6 +186,28 @@ static char *get_tag (struct id3_tag *tag, const char *what)
  	return comm;
  }
  
-+int get_tag_rating (struct id3_tag *tag)
++static int get_tag_rating (struct id3_tag *tag)
 +{
 +	struct id3_frame *frame;
-+	union id3_field *field;
++	int raw_rating;
++	int rating;
 +
 +	frame = id3_tag_findframe (tag, "POPM", 0);
 +	if (frame && frame->nfields >= 2)
-+		return (int)id3_field_getint(&frame->fields[1]);
++		raw_rating = (int)id3_field_getint(&frame->fields[1]);
 +	else
-+		return 0;
++		return -1;
++
++	if (raw_rating < 0 || raw_rating > 255)
++		return -1;
++
++	for (rating = 0; rating <= 5; ++rating)
++		if (raw_rating <= tag_rating_scale[rating])
++			return rating;
++
++	return -1;
 +}
 +
  static int count_time_internal (struct mp3_data *data)
  {
  	struct xing xing;
-@@ -453,7 +465,7 @@ static void mp3_info (const char *file_name, struct file_tags *info,
- 		const int tags_sel)
- {
- 
--	if (tags_sel & TAGS_COMMENTS) {
-+	if ((tags_sel & TAGS_COMMENTS) || (tags_sel & TAGS_RATING)) {
- 		struct id3_tag *tag;
- 		struct id3_file *id3file;
- 		char *track = NULL;
-@@ -462,7 +474,8 @@ static void mp3_info (const char *file_name, struct file_tags *info,
- 		if (!id3file)
- 			return;
- 		tag = id3_file_tag (id3file);
--		if (tag) {
-+
-+		if (tag && (tags_sel & TAGS_COMMENTS)) {
+@@ -466,6 +490,7 @@ static void mp3_info (const char *file_name, struct file_tags *info,
  			info->artist = get_tag (tag, ID3_FRAME_ARTIST);
  			info->title = get_tag (tag, ID3_FRAME_TITLE);
  			info->album = get_tag (tag, ID3_FRAME_ALBUM);
-@@ -477,6 +490,9 @@ static void mp3_info (const char *file_name, struct file_tags *info,
- 				free (track);
- 			}
- 		}
-+		if (tag && (tags_sel & TAGS_RATING))
 +			info->rating = get_tag_rating (tag);
-+
- 		id3_file_close (id3file);
- 	}
+ 			track = get_tag (tag, ID3_FRAME_TRACK);
  
+ 			if (track) {
 diff --git a/decoder_plugins/vorbis/vorbis.c b/decoder_plugins/vorbis/vorbis.c
-index f8291ee..faccb5d 100644
+index f8291ee..db5724e 100644
 --- a/decoder_plugins/vorbis/vorbis.c
 +++ b/decoder_plugins/vorbis/vorbis.c
-@@ -68,9 +68,11 @@ struct vorbis_data
+@@ -52,6 +52,9 @@ static const int64_t time_scaler = 1;
+ static const int64_t time_scaler = 1000;
+ #endif
+ 
++/* First value should be checked for equality. */
++static double comment_rating_scale[] = { 0.5, 0.2, 0.4, 0.6, 0.8, 1.0 };
++
+ struct vorbis_data
+ {
+ 	struct io_stream *stream;
+@@ -68,6 +71,34 @@ struct vorbis_data
  	struct file_tags *tags;
  };
  
--static void get_comment_tags (OggVorbis_File *vf, struct file_tags *info)
-+static void get_comment_tags (OggVorbis_File *vf, struct file_tags *info,
-+		const bool get_rating)
++static int get_comment_rating (const char *rating_comment)
++{
++	char *rating_str;
++	char *rating_str_end;
++	double raw_rating;
++	int rating;
++
++	rating_str = strchr (rating_comment, '=') + 1;
++	if (rating_str == 0)
++		return -1;
++			
++	raw_rating = strtod (rating_str, &rating_str_end);
++	if (*rating_str_end != 0)
++		return -1;
++
++	if (raw_rating < 0.0 || raw_rating > 1.0)
++		return -1;
++
++	if (raw_rating == comment_rating_scale[0])
++		return 0;
++
++	for (rating = 1; rating <= 5; ++rating)
++		if (raw_rating <= comment_rating_scale[rating])
++			return rating;
++
++	return -1;
++}
++
+ static void get_comment_tags (OggVorbis_File *vf, struct file_tags *info)
  {
  	int i;
-+	char * rating_str = 0;
- 	vorbis_comment *comments;
- 
- 	comments = ov_comment (vf, -1);
-@@ -98,6 +100,10 @@ static void get_comment_tags (OggVorbis_File *vf, struct file_tags *info)
+@@ -98,6 +129,10 @@ static void get_comment_tags (OggVorbis_File *vf, struct file_tags *info)
  					"track=", strlen ("track=")))
  			info->track = atoi (comments->user_comments[i]
  					+ strlen ("track="));
-+		else if (get_rating && !strncasecmp(comments->user_comments[i],
++		else if (!strncasecmp(comments->user_comments[i],
 +					"rating:", strlen ("rating:")) &&
-+				(rating_str = strchr(comments->user_comments[i], '=')))
-+			info->rating = (int)(255 * atof(rating_str + 1));
++				info->rating <= 0)
++			info->rating = get_comment_rating(comments->user_comments[i]);
  	}
  }
  
-@@ -168,7 +174,7 @@ static void vorbis_tags (const char *file_name, struct file_tags *info,
- 	}
- 
- 	if (tags_sel & TAGS_COMMENTS)
--		get_comment_tags (&vf, info);
-+		get_comment_tags (&vf, info, tags_sel & TAGS_RATING);
- 
- 	if (tags_sel & TAGS_TIME) {
- 		int64_t vorbis_time;
-@@ -254,7 +260,7 @@ static void vorbis_open_stream_internal (struct vorbis_data *data)
- 		if (duration >= 0)
- 			data->duration = duration / time_scaler;
- 		data->ok = 1;
--		get_comment_tags (&data->vf, data->tags);
-+		get_comment_tags (&data->vf, data->tags, true);
- 	}
- }
- 
-@@ -364,7 +370,7 @@ static int vorbis_decode (void *prv_data, char *buf, int buf_len,
- 			data->tags_change = 1;
- 			tags_free (data->tags);
- 			data->tags = tags_new ();
--			get_comment_tags (&data->vf, data->tags);
-+			get_comment_tags (&data->vf, data->tags, true);
- 		}
- 
- 		info = ov_info (&data->vf, -1);
-diff --git a/interface.c b/interface.c
-index fb96feb..b081fe1 100644
---- a/interface.c
-+++ b/interface.c
-@@ -553,8 +553,12 @@ static int get_tags_setting ()
- {
- 	int needed_tags = 0;
- 
--	if (options_get_int("ReadTags"))
-+	if (options_get_int("ReadTags")) {
- 		needed_tags |= TAGS_COMMENTS;
-+
-+	    if (options_get_int("ShowRating"))
-+		    needed_tags |= TAGS_RATING;
-+    }
- 	if (!strcasecmp(options_get_str("ShowTime"), "yes"))
- 		needed_tags |= TAGS_TIME;
- 
-@@ -857,8 +861,13 @@ static void event_plist_add (const struct plist_item *item)
- 		int i;
- 
- 		if (options_get_int("ReadTags")
--				&& (!item->tags || !item->tags->title))
-+				&& (!item->tags || !item->tags->title)) {
- 			needed_tags |= TAGS_COMMENTS;
-+
-+			if (options_get_int("ShowRating")
-+					&& (!item->tags || item->tags->rating == -1))
-+				needed_tags |= TAGS_RATING;
-+		}
- 		if (!strcasecmp(options_get_str("ShowTime"), "yes")
- 				&& (!item->tags || item->tags->time == -1))
- 			needed_tags |= TAGS_TIME;
 diff --git a/interface_elements.c b/interface_elements.c
-index 22d4356..eab29c9 100644
+index 22d4356..4c96d61 100644
 --- a/interface_elements.c
 +++ b/interface_elements.c
 @@ -802,6 +802,8 @@ static void side_menu_init (struct side_menu *m, const enum side_menu_type type,
@@ -336,54 +250,100 @@ index 22d4356..eab29c9 100644
  		menu_set_show_time (m->menu.list.main,
  				strcasecmp(options_get_str("ShowTime"), "no"));
 +		menu_set_show_rating (m->menu.list.main,
-+				options_get_int("ReadTags") && options_get_int("ShowRating"));
++				options_get_bool("ShowRating"));
  		menu_set_info_attr_normal (m->menu.list.main,
  				get_color(CLR_MENU_ITEM_INFO));
  		menu_set_info_attr_sel (m->menu.list.main,
-@@ -1078,6 +1080,13 @@ static int add_to_menu (struct menu *menu, const struct plist *plist,
+@@ -1021,6 +1023,25 @@ static void main_win_destroy (struct main_win *w)
+ 		free (w->curr_file);
+ }
+ 
++static void rating_to_str (char *rating_str, const int rating)
++{
++	const char empty_star[] = " ";
++	const char filled_star[] = { 0xe2, 0x98, 0x85, '\0' }; // unicode 0x2606
++	int star_num;
++	int space_num;
++
++	assert (rating >= -1 && rating <= 5);
++
++	star_num = (rating < 0 ? 0 : rating);
++	space_num = 5 - star_num;
++
++	rating_str[0] = '\0';
++	while (star_num--)
++		strcat (rating_str, filled_star);
++	while (space_num--)
++		strcat (rating_str, empty_star);
++}
++
+ /* Make a title suitable to display in a menu from the title of a playlist item.
+  * Returned memory is malloc()ed.
+  * made_from tags - was the playlist title made from tags?
+@@ -1077,6 +1098,13 @@ static int add_to_menu (struct menu *menu, const struct plist *plist,
+ 		sec_to_min (time_str, item->tags->time);
  		menu_item_set_time (added, time_str);
  	}
- 
-+	if (item->tags && item->tags->rating != -1) {
++ 
++ 	if (item->tags && item->tags->rating != -1) {
 +		char rating_str[16];
 +
 +		rating_to_str (rating_str, item->tags->rating);
-+		menu_item_set_rating (added, rating_str);
-+	}
-+
++ 		menu_item_set_rating (added, rating_str);
++ 	}
+ 
  	menu_item_set_attr_normal (added, get_color(CLR_MENU_ITEM_FILE));
  	menu_item_set_attr_sel (added, get_color(CLR_MENU_ITEM_FILE_SELECTED));
- 	menu_item_set_attr_marked (added, get_color(CLR_MENU_ITEM_FILE_MARKED));
-@@ -1111,6 +1120,8 @@ static void side_menu_clear (struct side_menu *m)
+@@ -1111,6 +1139,7 @@ static void side_menu_clear (struct side_menu *m)
  	menu_set_show_format (m->menu.list.main, options_get_int("ShowFormat"));
  	menu_set_show_time (m->menu.list.main,
  			strcasecmp(options_get_str("ShowTime"), "no"));
-+	menu_set_show_rating (m->menu.list.main,
-+			options_get_int("ReadTags") && options_get_int("ShowRating"));
++	menu_set_show_rating (m->menu.list.main, options_get_bool("ShowRating"));
  	menu_set_info_attr_normal (m->menu.list.main, get_color(CLR_MENU_ITEM_INFO));
  	menu_set_info_attr_sel (m->menu.list.main, get_color(CLR_MENU_ITEM_INFO_SELECTED));
  	menu_set_info_attr_marked (m->menu.list.main, get_color(CLR_MENU_ITEM_INFO_MARKED));
-@@ -1433,6 +1444,15 @@ static void update_menu_item (struct menu_item *mi,
+@@ -1432,6 +1461,15 @@ static void update_menu_item (struct menu_item *mi,
+ 	}
  	else
  		menu_item_set_time (mi, "");
++ 
++ 	if (item->tags && item->tags->rating != -1) {
++ 		char rating_str[16];
++ 
++ 		rating_to_str (rating_str, item->tags->rating);
++ 		menu_item_set_rating (mi, rating_str);
++ 	}
++ 	else
++ 		menu_item_set_rating (mi, "");
  
-+	if (item->tags && item->tags->rating != -1) {
-+		char rating_str[16];
-+
-+		rating_to_str (rating_str, item->tags->rating);
-+		menu_item_set_rating (mi, rating_str);
-+	}
-+	else
-+		menu_item_set_rating (mi, "");
-+
  	made_from_tags = (options_get_bool ("ReadTags") && item->title_tags);
  
- 	if (made_from_tags)
 diff --git a/menu.c b/menu.c
-index c12621e..ebec4ea 100644
+index c12621e..e2d3071 100644
 --- a/menu.c
 +++ b/menu.c
-@@ -125,15 +125,56 @@ static void draw_item (const struct menu *menu, const struct menu_item *mi,
+@@ -107,6 +107,20 @@ static void draw_item (const struct menu *menu, const struct menu_item *mi,
+ 		}
+ 	}
+ 
++	/* Rating - keep the "theme", but not selected nor bold.
++	   Some utf8 chars do not have bold versions. */
++	if (menu->show_rating) {
++		wmove (menu->win, pos, item_info_pos + 1);
++		if (mi == menu->marked)
++			wattrset (menu->win, mi->attr_marked);
++		else
++			wattrset (menu->win, mi->attr_normal);
++		wattroff (menu->win, A_BOLD);
++
++		xmvwadd_rating_str (menu->win, pos, item_info_pos + 1,
++				*mi->rating != 0 ? mi->rating : "     ");
++	}
++
+ 	/* Description. */
+ 	if (draw_selected && mi == menu->selected && mi == menu->marked)
+ 		wattrset (menu->win, menu->info_attr_sel_marked);
+@@ -125,15 +139,35 @@ static void draw_item (const struct menu *menu, const struct menu_item *mi,
  		xwaddstr (menu->win, "]");
  	}
  
@@ -410,36 +370,15 @@ index c12621e..ebec4ea 100644
 +		xwprintw (menu->win, "[");
 +
 +		if (menu->show_rating) {
-+
-+			/* Change the rating theme.
-+			   TODO: Define new attrs for rating stars? */
-+			if (mi == menu->marked)
-+				wattrset (menu->win, mi->attr_marked);
-+			else
-+				wattrset (menu->win, mi->attr_normal);
-+
-+			wattroff (menu->win, A_BOLD); /* Some chars cannot be bold. */
-+
-+			xwprintw (menu->win, "%5s",
-+					*mi->rating != 0 ? mi->rating : "     ");
-+
-+			/* Restore the theme. */
-+			if (draw_selected && mi == menu->selected && mi == menu->marked)
-+				wattrset (menu->win, menu->info_attr_sel_marked);
-+			else if (draw_selected && mi == menu->selected)
-+				wattrset (menu->win, menu->info_attr_sel);
-+			else if (mi == menu->marked)
-+				wattrset (menu->win, menu->info_attr_marked);
-+			else
-+				wattrset (menu->win, menu->info_attr_normal);
++			wmove (menu->win, pos, item_info_pos + 6); /* Already printed. */
 +
 +			if (separators--)
-+				xwprintw(menu->win, "|");
++				xwprintw (menu->win, "|");
 +		}
 +		if (menu->show_time) {
 +			xwprintw (menu->win, "%5s", mi->time ? mi->time : "  ");
 +			if (separators--)
-+				xwprintw(menu->win, "|");
++				xwprintw (menu->win, "|");
 +		}
 +		if (menu->show_format && *mi->format)
 +			xwprintw (menu->win, "%3s", mi->format);
@@ -449,7 +388,7 @@ index c12621e..ebec4ea 100644
  }
  
  void menu_draw (const struct menu *menu, const int active)
-@@ -142,6 +183,7 @@ void menu_draw (const struct menu *menu, const int active)
+@@ -142,6 +176,7 @@ void menu_draw (const struct menu *menu, const int active)
  	int title_width;
  	int info_pos;
  	int number_space = 0;
@@ -457,7 +396,7 @@ index c12621e..ebec4ea 100644
  
  	assert (menu != NULL);
  
-@@ -157,16 +199,22 @@ void menu_draw (const struct menu *menu, const int active)
+@@ -157,16 +192,22 @@ void menu_draw (const struct menu *menu, const int active)
  	else
  		number_space = 0;
  
@@ -485,7 +424,7 @@ index c12621e..ebec4ea 100644
  	else {
  		title_width = menu->width;
  		info_pos = title_width;
-@@ -234,6 +282,7 @@ struct menu *menu_new (WINDOW *win, const int posx, const int posy,
+@@ -234,6 +275,7 @@ struct menu *menu_new (WINDOW *win, const int posx, const int posy,
  	menu->marked = NULL;
  	menu->show_time = 0;
  	menu->show_format = 0;
@@ -493,7 +432,7 @@ index c12621e..ebec4ea 100644
  	menu->info_attr_normal = A_NORMAL;
  	menu->info_attr_sel = A_NORMAL;
  	menu->info_attr_marked = A_NORMAL;
-@@ -268,6 +317,7 @@ struct menu_item *menu_add (struct menu *menu, const char *title,
+@@ -268,6 +310,7 @@ struct menu_item *menu_add (struct menu *menu, const char *title,
  
  	mi->time[0] = 0;
  	mi->format[0] = 0;
@@ -501,7 +440,7 @@ index c12621e..ebec4ea 100644
  	mi->queue_pos = 0;
  
  	mi->next = NULL;
-@@ -308,6 +358,7 @@ static struct menu_item *menu_add_from_item (struct menu *menu,
+@@ -308,6 +351,7 @@ static struct menu_item *menu_add_from_item (struct menu *menu,
  
  	strncpy(new->time, mi->time, FILE_TIME_STR_SZ);
  	strncpy(new->format, mi->format, FILE_FORMAT_SZ);
@@ -509,7 +448,7 @@ index c12621e..ebec4ea 100644
  
  	return new;
  }
-@@ -562,6 +613,7 @@ struct menu *menu_filter_pattern (const struct menu *menu, const char *pattern)
+@@ -562,6 +606,7 @@ struct menu *menu_filter_pattern (const struct menu *menu, const char *pattern)
  			menu->height);
  	menu_set_show_time (new, menu->show_time);
  	menu_set_show_format (new, menu->show_format);
@@ -517,7 +456,7 @@ index c12621e..ebec4ea 100644
  	menu_set_info_attr_normal (new, menu->info_attr_normal);
  	menu_set_info_attr_sel (new, menu->info_attr_sel);
  	menu_set_info_attr_marked (new, menu->info_attr_marked);
-@@ -626,6 +678,15 @@ void menu_item_set_format (struct menu_item *mi, const char *format)
+@@ -626,6 +671,15 @@ void menu_item_set_format (struct menu_item *mi, const char *format)
  			== 0);
  }
  
@@ -533,7 +472,7 @@ index c12621e..ebec4ea 100644
  void menu_item_set_queue_pos (struct menu_item *mi, const int pos)
  {
  	assert (mi != NULL);
-@@ -647,6 +708,13 @@ void menu_set_show_format (struct menu *menu, const int t)
+@@ -647,6 +701,13 @@ void menu_set_show_format (struct menu *menu, const int t)
  	menu->show_format = t;
  }
  
@@ -548,14 +487,14 @@ index c12621e..ebec4ea 100644
  {
  	assert (menu != NULL);
 diff --git a/menu.h b/menu.h
-index 8efe425..823c10e 100644
+index 8efe425..8db96a5 100644
 --- a/menu.h
 +++ b/menu.h
 @@ -34,6 +34,7 @@ enum menu_align
  
  #define FILE_TIME_STR_SZ        6
  #define FILE_FORMAT_SZ          4
-+#define FILE_RATING_SZ			16
++#define FILE_RATING_SZ          16
  
  struct menu_item
  {
@@ -632,20 +571,10 @@ index 9138db1..5504575 100644
  
  	return tags;
 diff --git a/playlist.h b/playlist.h
-index 37f8500..e49b4df 100644
+index 37f8500..ec3ca19 100644
 --- a/playlist.h
 +++ b/playlist.h
-@@ -20,7 +20,8 @@ typedef int plist_t_item_ix;
- enum tags_select
- {
- 	TAGS_COMMENTS	= 0x01, /* artist, title, etc. */
--	TAGS_TIME	= 0x02 /* time of the file. */
-+	TAGS_TIME	= 0x02, /* time of the file. */
-+	TAGS_RATING = 0x04 /* rating */
- };
- 
- struct file_tags
-@@ -30,6 +31,7 @@ struct file_tags
+@@ -30,6 +30,7 @@ struct file_tags
  	char *album;
  	int track;
  	int time;
@@ -666,14 +595,14 @@ index f439821..ce6bcbf 100644
  		}
  
 diff --git a/protocol.c b/protocol.c
-index 1482eb0..bdad872 100644
+index 1482eb0..3d343cd 100644
 --- a/protocol.c
 +++ b/protocol.c
 @@ -283,6 +283,7 @@ void packet_buf_add_tags (struct packet_buf *b, const struct file_tags *tags)
  		packet_buf_add_str (b, tags->album ? tags->album : "");
  		packet_buf_add_int (b, tags->track);
  		packet_buf_add_int (b, tags->filled & TAGS_TIME ? tags->time : -1);
-+		packet_buf_add_int (b, tags->filled & TAGS_RATING ? tags->rating : -1);
++		packet_buf_add_int (b, tags->rating);
  		packet_buf_add_int (b, tags->filled);
  	}
  	else {
@@ -698,23 +627,19 @@ index 1482eb0..bdad872 100644
  	if (!get_int(sock, &tags->filled)) {
  		logit ("Error while receiving 'filled'");
  		tags_free (tags);
-diff --git a/server.c b/server.c
-index b3cdc18..83a7dd8 100644
---- a/server.c
-+++ b/server.c
-@@ -462,7 +462,7 @@ static void on_song_change ()
- 	}
- 
- 	curr_tags = tags_cache_get_immediate (&tags_cache, curr_file,
--	                                      TAGS_COMMENTS | TAGS_TIME);
-+	                                      TAGS_COMMENTS | TAGS_TIME | TAGS_RATING);
- 	arg_list = lists_strs_new (lists_strs_size (on_song_change));
- 	for (ix = 0; ix < lists_strs_size (on_song_change); ix += 1) {
- 		char *arg, *str;
 diff --git a/tags_cache.c b/tags_cache.c
-index 72e0e9a..79a2b23 100644
+index 72e0e9a..3a24a5d 100644
 --- a/tags_cache.c
 +++ b/tags_cache.c
+@@ -65,7 +65,7 @@
+  * temporarily set it to zero to disable cache activity during structural
+  * changes which require multiple commits.
+  */
+-#define CACHE_DB_FORMAT_VERSION	1
++#define CACHE_DB_FORMAT_VERSION	2
+ 
+ /* How frequently to flush the tags database to disk.  A value of zero
+  * disables flushing. */
 @@ -217,7 +217,8 @@ static char *cache_record_serialize (const struct cache_record *rec, int *len)
  		+ album_len
  		+ title_len
@@ -743,15 +668,60 @@ index 72e0e9a..79a2b23 100644
  
  		if (rec->tags->title)
  			rec->tags->filled |= TAGS_COMMENTS;
-@@ -318,6 +323,9 @@ static int cache_record_deserialize (struct cache_record *rec,
+diff --git a/utf8.c b/utf8.c
+index 246e359..a35cad9 100644
+--- a/utf8.c
++++ b/utf8.c
+@@ -279,6 +279,29 @@ int xmvwaddnstr (WINDOW *win, const int y, const int x, const char *str,
+ 	return res;
+ }
  
- 		if (rec->tags->time >= 0)
- 			rec->tags->filled |= TAGS_TIME;
++int xmvwadd_rating_str (WINDOW *win, const int y, const int x,
++		const char *rating_str)
++{
++	int res;
 +
-+		if (rec->tags->rating >= 0)
-+			rec->tags->filled |= TAGS_RATING;
++	if (using_utf8)
++		res = mvwaddstr (win, y, x, rating_str);
++	else {
++		char buf[6];
++		int i;
++
++		strncpy(buf, rating_str + strlen(rating_str) - 5, 6);
++
++		for (i = 0; i <= 4; ++i)
++			if (buf[i] != ' ')
++				buf[i] = '*';
++
++		res = mvwaddstr (win, y, x, buf);
++	}
++
++	return res;
++}
++
+ int xwprintw (WINDOW *win, const char *fmt, ...)
+ {
+ 	va_list va;
+@@ -349,7 +372,6 @@ void utf8_init ()
+ 	{
+ 		xterm_iconv_desc = iconv_open ("", "UTF-8");
  	}
+-
+ }
  
- 	return 1;
+ void utf8_cleanup ()
+diff --git a/utf8.h b/utf8.h
+index 09282aa..fbdf538 100644
+--- a/utf8.h
++++ b/utf8.h
+@@ -28,6 +28,8 @@ int xwaddnstr (WINDOW *win, const char *str, const int n);
+ int xmvwaddstr (WINDOW *win, const int y, const int x, const char *str);
+ int xmvwaddnstr (WINDOW *win, const int y, const int x, const char *str,
+ 		const int n);
++int xmvwadd_rating_str (WINDOW *win, const int y, const int x,
++		const char *rating_str);
+ #ifdef HAVE__ATTRIBUTE__
+ int xwprintw (WINDOW *win, const char *fmt, ...)
+ 	__attribute__ ((format (printf, 2, 3)));
 -- 
 tg: (67f7d00..) t/ratings (depends on: master)
